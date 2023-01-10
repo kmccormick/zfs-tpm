@@ -1,0 +1,27 @@
+#!/bin/sh
+PREREQ=""
+prereqs()
+{
+	echo "$PREREQ"
+}
+
+case $1 in
+prereqs)
+	prereqs
+	exit 0
+	;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+# Copy binaries and configuration
+copy_file config /etc/tcsd.conf
+copy_file config /var/lib/tpm/system.data
+copy_exec /usr/sbin/tcsd
+
+# Create user & group entries
+getent passwd tss >> ${DESTDIR}/etc/passwd
+getent group tss >> ${DESTDIR}/etc/group
+
+# Create /etc/hosts
+grep -e localhost -e ip6- /etc/hosts >> ${DESTDIR}/etc/hosts

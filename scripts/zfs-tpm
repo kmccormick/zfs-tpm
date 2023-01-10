@@ -1,0 +1,83 @@
+# Override the default ZFS boot stub's decrypt_fs() function with one
+# that supports unlocking using TPM sealed data.
+
+# First source the "upstream" zfs functions script
+. scripts/zfs
+
+# Then redefine decrypt_fs() with TPM support
+decrypt_fs()
+{
+	fs="$1"
+
+	# If pool encryption is active and the zfs command understands '-o encryption'
+	if [ "$(zpool list -H -o feature@encryption "${fs%%/*}")" = 'active' ]; then
+
+		# Determine dataset that holds key for root dataset
+		ENCRYPTIONROOT="$(get_fs_value "${fs}" encryptionroot)"
+		KEYLOCATION="$(get_fs_value "${ENCRYPTIONROOT}" keylocation)"
+
+		echo "${ENCRYPTIONROOT}" > /run/zfs_fs_name
+
+		# If root dataset is encrypted...
+		if ! [ "${ENCRYPTIONROOT}" = "-" ]; then
+			KEYSTATUS="$(get_fs_value "${ENCRYPTIONROOT}" keystatus)"
+			# Continue only if the key needs to be loaded
+			[ "$KEYSTATUS" = "unavailable" ] || return 0
+
+			# First try to load key from tpm-sealed file at /$ENCRYPTIONROOT.tpm (s,/,-,)
+			if [ -c /dev/tpm0 ]; then
+				local TPM_SEALED_KEY="/$(echo "${ENCRYPTIONROOT}" | tr / -).tpm"
+				if [ -r "${TPM_SEALED_KEY}" ]; then
+					log_begin_msg "Unsealing tpm-protected key for ${ENCRYPTIONROOT}"
+					local TPM_UNSEALED_KEY="$(tpm_unsealdata -z -i "${TPM_SEALED_KEY}")"
+					if [ -n "$TPM_UNSEALED_KEY" ]; then
+						log_end_msg
+						log_begin_msg "Unlocking ${ENCRYPTIONROOT} with unsealed key"
+						if echo "$TPM_UNSEALED_KEY" | $ZFS load-key "${ENCRYPTIONROOT}"; then
+							unset TPM_UNSEALED_KEY
+							log_end_msg
+							return 0
+						else
+							unset TPM_UNSEALED_KEY
+							log_failure_msg "key did not unlock dataset"
+						fi
+					else
+						log_failure_msg "tpm unseal failed"
+					fi
+				fi
+			fi
+
+			# Do not prompt if key is stored noninteractively,
+			if ! [ "${KEYLOCATION}" = "prompt" ]; then
+				$ZFS load-key "${ENCRYPTIONROOT}"
+
+			# Prompt with plymouth, if active
+			elif /bin/plymouth --ping 2>/dev/null; then
+				echo "plymouth" > /run/zfs_console_askpwd_cmd
+				for _ in 1 2 3; do
+					plymouth ask-for-password --prompt "Encrypted ZFS password for ${ENCRYPTIONROOT}" | \
+						$ZFS load-key "${ENCRYPTIONROOT}" && break
+				done
+
+			# Prompt with systemd, if active
+			elif [ -e /run/systemd/system ]; then
+				echo "systemd-ask-password" > /run/zfs_console_askpwd_cmd
+				for _ in 1 2 3; do
+					systemd-ask-password --no-tty "Encrypted ZFS password for ${ENCRYPTIONROOT}" | \
+						$ZFS load-key "${ENCRYPTIONROOT}" && break
+				done
+
+			# Prompt with ZFS tty, otherwise
+			else
+				# Temporarily setting "printk" to "7" allows the prompt to appear even when the "quiet" kernel option has been used
+				echo "load-key" > /run/zfs_console_askpwd_cmd
+				read -r storeprintk _ < /proc/sys/kernel/printk
+				echo 7 > /proc/sys/kernel/printk
+				$ZFS load-key "${ENCRYPTIONROOT}"
+				echo "$storeprintk" > /proc/sys/kernel/printk
+			fi
+		fi
+	fi
+
+	return 0
+}
